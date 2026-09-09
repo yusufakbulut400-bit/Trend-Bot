@@ -446,3 +446,4 @@ with tab2:
                 with st.expander(f"⚠️ {len(errors)} sembolde hata oluştu (detay için tıkla)"):
                     for err in errors:
                         st.write(f"- {err}")
+                        st.set_page_config(page_title="Trend Following Analiz Botu", page_icon="📈", layout="wide")
