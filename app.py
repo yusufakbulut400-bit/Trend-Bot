@@ -345,7 +345,6 @@ def run_backtest(raw_df, min_confidence=0, allow_short=False, cash_rate_annual=0
     strat_return = pd.Series(strat_return_arr, index=df.index)
 
     equity = (1 + strat_return).cumprod()
-    buyhold_equity = (1 + daily_return).cumprod()
 
     # --- İşlem listesi çıkarma ---
     trades = []
@@ -382,7 +381,6 @@ def run_backtest(raw_df, min_confidence=0, allow_short=False, cash_rate_annual=0
     trades_df = pd.DataFrame(trades)
 
     total_return = (equity.iloc[-1] - 1) * 100
-    buyhold_return = (buyhold_equity.iloc[-1] - 1) * 100
 
     if len(trades_df) > 0:
         wins = trades_df[trades_df["Getiri %"] > 0]
@@ -402,12 +400,10 @@ def run_backtest(raw_df, min_confidence=0, allow_short=False, cash_rate_annual=0
 
     return {
         "equity": equity,
-        "buyhold_equity": buyhold_equity,
         "drawdown": drawdown,
         "trades": trades_df,
         "stats": {
             "total_return": total_return,
-            "buyhold_return": buyhold_return,
             "num_trades": len(trades_df),
             "win_rate": win_rate,
             "avg_win": avg_win,
@@ -545,6 +541,133 @@ ASSET_LISTS = {
         "Koç Holding": "KCHOL.IS",
     },
 }
+
+
+# ============================================================
+# BIST 30 DEĞERLEME PANELİ (temel analiz ağırlıklı)
+# ============================================================
+# NOT: Liste 9 Eylül 2026'da doğrulanan, Borsa İstanbul'un
+# 1 Temmuz - 30 Eylül 2026 dönemi için geçerli resmi BIST 30
+# bileşenlerine dayanır. Endeks üç ayda bir yeniden gözden
+# geçirilir (bir sonraki güncelleme dönemi: Ekim 2026 başı) —
+# o tarihten sonra listeyi kontrol edip gerekirse düzenle.
+
+BIST30_DEFAULT_TICKERS = [
+    "AEFES.IS", "AKBNK.IS", "ASELS.IS", "ASTOR.IS", "BIMAS.IS",
+    "DSTKF.IS", "EKGYO.IS", "ENKAI.IS", "EREGL.IS", "FROTO.IS",
+    "GARAN.IS", "GUBRF.IS", "ISCTR.IS", "KCHOL.IS", "KRDMD.IS",
+    "MGROS.IS", "PETKM.IS", "PGSUS.IS", "SAHOL.IS", "SASA.IS",
+    "SISE.IS", "TAVHL.IS", "TCELL.IS", "THYAO.IS", "TOASO.IS",
+    "TRALT.IS", "TTKOM.IS", "TUPRS.IS", "VAKBN.IS", "YKBNK.IS",
+]
+
+# Yahoo Finance'in 'sector'/'industry' alanı bazı BIST hisselerinde
+# boş dönebiliyor — bu yüzden ek olarak elle bir sektör haritası
+# tutuyoruz, dinamik veri eksik kalırsa buna düşer.
+BIST30_SECTOR_FALLBACK = {
+    "AEFES": "Gıda & İçecek", "AKBNK": "Bankacılık", "ASELS": "Savunma Sanayii",
+    "ASTOR": "Enerji Ekipmanları", "BIMAS": "Perakende", "DSTKF": "Finans",
+    "EKGYO": "Gayrimenkul", "ENKAI": "İnşaat", "EREGL": "Demir-Çelik",
+    "FROTO": "Otomotiv", "GARAN": "Bankacılık", "GUBRF": "Kimya/Gübre",
+    "ISCTR": "Bankacılık", "KCHOL": "Holding", "KRDMD": "Demir-Çelik",
+    "MGROS": "Perakende", "PETKM": "Petrokimya", "PGSUS": "Havacılık",
+    "SAHOL": "Holding", "SASA": "Kimya", "SISE": "Cam/Sanayi",
+    "TAVHL": "Havacılık", "TCELL": "Telekom", "THYAO": "Havacılık",
+    "TOASO": "Otomotiv", "TRALT": "Madencilik", "TTKOM": "Telekom",
+    "TUPRS": "Rafineri/Enerji", "VAKBN": "Bankacılık", "YKBNK": "Bankacılık",
+}
+
+
+@st.cache_data(ttl=3600)
+def fetch_bist30_fundamentals(tickers):
+    """Her hisse için değerleme (F/K, PD/DD, temettü), kârlılık (ROE, net
+    kâr marjı), risk (beta) ve fiyat momentumu (1A/3A/Yılbaşından bu yana
+    getiri) verilerini çeker. Bazı alanlar bazı hisselerde eksik olabilir
+    (Yahoo Finance'in BIST kapsama kısıtı)."""
+    rows = []
+    for t in tickers:
+        symbol_short = t.replace(".IS", "")
+        try:
+            ticker_obj = yf.Ticker(t)
+            info = ticker_obj.info
+
+            hist = ticker_obj.history(period="1y")
+            last_close = float(hist["Close"].iloc[-1]) if not hist.empty else None
+
+            def pct_change_back(n_bars):
+                if hist.empty or len(hist) <= n_bars or last_close is None:
+                    return None
+                past = float(hist["Close"].iloc[-1 - n_bars])
+                if past == 0:
+                    return None
+                return (last_close / past - 1) * 100
+
+            ytd_return = None
+            if not hist.empty and last_close is not None:
+                this_year = hist[hist.index.year == hist.index[-1].year]
+                if len(this_year) > 1:
+                    first_close = float(this_year["Close"].iloc[0])
+                    if first_close != 0:
+                        ytd_return = (last_close / first_close - 1) * 100
+
+            sector = info.get("sector") or BIST30_SECTOR_FALLBACK.get(symbol_short, "Diğer")
+
+            rows.append({
+                "Sembol": symbol_short,
+                "Sektör": sector,
+                "F/K": info.get("trailingPE"),
+                "PD/DD": info.get("priceToBook"),
+                "Temettü Verimi %": (info.get("dividendYield") * 100
+                                      if info.get("dividendYield") else None),
+                "Piyasa Değeri (Milyar $)": (info.get("marketCap") / 1e9
+                                              if info.get("marketCap") else None),
+                "ROE %": (info.get("returnOnEquity") * 100
+                          if info.get("returnOnEquity") else None),
+                "Net Kâr Marjı %": (info.get("profitMargins") * 100
+                                     if info.get("profitMargins") else None),
+                "Beta": info.get("beta"),
+                "1A Getiri %": pct_change_back(21),
+                "3A Getiri %": pct_change_back(63),
+                "YBB Getiri %": ytd_return,
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def compute_value_scores(df):
+    """Şeffaf, çok faktörlü bir 'Değerleme Skoru' (0-100) hesaplar.
+    Düşük F/K ve PD/DD daha iyi (ucuzluk), yüksek temettü verimi ve ROE
+    daha iyi (kârlılık/getiri) olarak puanlanır — her metrik, listedeki
+    diğer hisselere göre yüzdelik dilimine (percentile) çevrilir, sonra
+    eşit ağırlıkla ortalanır. Bu bir 'doğru fiyat' iddiası değil, sadece
+    listedeki hisseleri birbirine göre sıralayan göreli bir ölçüttür."""
+    df = df.copy()
+
+    def low_better(s):
+        return (1 - s.rank(pct=True)) * 100
+
+    def high_better(s):
+        return s.rank(pct=True) * 100
+
+    df["_pe"] = low_better(df["F/K"])
+    df["_pb"] = low_better(df["PD/DD"])
+    df["_dy"] = high_better(df["Temettü Verimi %"])
+    df["_roe"] = high_better(df["ROE %"])
+
+    score_cols = ["_pe", "_pb", "_dy", "_roe"]
+    df["Metrik Sayısı"] = df[score_cols].notna().sum(axis=1)
+    df["Değerleme Skoru"] = df[score_cols].mean(axis=1, skipna=True).round(0)
+    df.loc[df["Metrik Sayısı"] < 2, "Değerleme Skoru"] = np.nan
+    df = df.drop(columns=score_cols)
+    return df
+
+
+def weighted_avg(values, weights):
+    mask = values.notna() & weights.notna()
+    if mask.sum() == 0:
+        return None
+    return float(np.average(values[mask], weights=weights[mask]))
 
 
 def render_single_result(df, result, symbol):
@@ -693,8 +816,8 @@ with st.expander("🌍 Makro Bağlam (Altın, BIST 30, Dolar Endeksi, Faiz, USD/
         else:
             st.caption("Makro veriler şu an çekilemedi.")
 
-tab1, tab2, tab3 = st.tabs(
-    ["🔍 Tekli Analiz", "📊 Çoklu Varlık Tarama", "🧪 Backtest"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["🔍 Tekli Analiz", "📊 Çoklu Varlık Tarama", "🧪 Backtest", "🇹🇷 BIST 30 Değerleme"]
 )
 
 # --------------------------------------------------------------
@@ -871,26 +994,20 @@ with tab3:
 
                     st.divider()
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Strateji Getirisi", f"{stats['total_return']:.1f}%")
-                    m2.metric("Al-ve-Tut (Buy&Hold)", f"{stats['buyhold_return']:.1f}%",
-                               delta=f"{stats['total_return'] - stats['buyhold_return']:.1f}% fark")
-                    m3.metric("İşlem Sayısı", f"{stats['num_trades']}")
+                    m1.metric("Toplam Getiri", f"{stats['total_return']:.1f}%")
+                    m2.metric("İşlem Sayısı", f"{stats['num_trades']}")
+                    m3.metric("Kazanma Oranı", f"{stats['win_rate']:.1f}%")
                     m4.metric("Maksimum Düşüş", f"{stats['max_drawdown']:.1f}%")
 
-                    m5, m6, m7 = st.columns(3)
-                    m5.metric("Kazanma Oranı", f"{stats['win_rate']:.1f}%")
-                    m6.metric("Ort. Kazanç / Ort. Kayıp",
+                    m5, m6 = st.columns(2)
+                    m5.metric("Ort. Kazanç / Ort. Kayıp",
                                f"{stats['avg_win']:.1f}% / {stats['avg_loss']:.1f}%")
                     pf = stats["profit_factor"]
-                    m7.metric("Kâr Faktörü", "∞" if (pf != pf) else f"{pf:.2f}")
+                    m6.metric("Kâr Faktörü", "∞" if (pf != pf) else f"{pf:.2f}")
 
                     st.divider()
-                    st.subheader("Getiri Eğrisi: Strateji vs Al-ve-Tut")
-                    equity_compare = pd.DataFrame({
-                        "Strateji": bt_result["equity"],
-                        "Al-ve-Tut": bt_result["buyhold_equity"],
-                    })
-                    st.line_chart(equity_compare)
+                    st.subheader("Getiri Eğrisi")
+                    st.line_chart(bt_result["equity"].rename("Strateji"))
 
                     st.subheader("Düşüş (Drawdown) Grafiği")
                     st.area_chart(bt_result["drawdown"])
@@ -902,10 +1019,10 @@ with tab3:
                         st.caption("Bu dönemde hiç işlem üretilmedi.")
 
                     st.info(
-                        "📌 **Nasıl okunmalı:** 'Strateji Getirisi' > 'Al-ve-Tut' ise, bot sinyali "
-                        "bu dönemde basitçe alıp beklemekten daha iyi performans göstermiş demektir. "
-                        "Az işlem sayısı ve büyük maksimum düşüş, sonucun tesadüfe daha açık olabileceğine "
-                        "işaret eder. Bu geçmiş performans, gelecekte aynı sonucu garanti etmez.",
+                        "📌 **Nasıl okunmalı:** Kâr faktörü 1'in üzerindeyse, kazanan işlemlerin "
+                        "toplamı kaybedenlerin toplamından fazla demektir. Az işlem sayısı ve büyük "
+                        "maksimum düşüş, sonucun tesadüfe daha açık olabileceğine işaret eder. "
+                        "Bu geçmiş performans, gelecekte aynı sonucu garanti etmez.",
                         icon="📌",
                     )
 
@@ -913,3 +1030,142 @@ with tab3:
                 st.error(f"Hata oluştu: {e}")
     else:
         st.info("👆 Sembol ve ayarları seçip **Backtest Çalıştır** butonuna bas.")
+
+# --------------------------------------------------------------
+# SEKME 4: BIST 30 DEĞERLEME PANELİ
+# --------------------------------------------------------------
+with tab4:
+    st.subheader("🇹🇷 BIST 30 — Temel Analiz Paneli")
+    st.caption(
+        "Endeksi oluşturan 30 hissenin değerleme (F/K, PD/DD, temettü), kârlılık "
+        "(ROE, net kâr marjı), risk (beta) ve fiyat momentumu verilerini birleştirir. "
+        "TCMB kararları, enflasyon, jeopolitik risk gibi makro yorumlar için sayfa "
+        "üstündeki '🌍 Makro Bağlam' panelini kullan — burası şirket düzeyinde veriye odaklanır."
+    )
+
+    st.warning(
+        "⚠️ Liste, 9 Eylül 2026'da doğrulanan Borsa İstanbul'un 2026 Q3 (1 Temmuz - "
+        "30 Eylül) resmi BIST 30 bileşenlerine dayanır. Endeks üç ayda bir yeniden "
+        "gözden geçirilir — bir sonraki dönemden (Ekim 2026) itibaren borsaistanbul.com "
+        "üzerinden kontrol edip gerekirse aşağıdan düzenle.",
+        icon="⚠️",
+    )
+
+    with st.expander("Sembol listesini görüntüle / düzenle"):
+        bist_tickers_input = st.text_area(
+            "BIST 30 Sembolleri (virgülle ayrılmış, .IS uzantılı)",
+            value=", ".join(BIST30_DEFAULT_TICKERS),
+            height=100,
+        )
+    bist_tickers = [t.strip() for t in bist_tickers_input.split(",") if t.strip()]
+
+    bist_run = st.button("📋 Temel Analiz Verilerini Çek", type="primary")
+
+    if bist_run:
+        if yf is None:
+            st.error("yfinance kurulu değil.")
+        else:
+            with st.spinner(f"{len(bist_tickers)} hisse için veri çekiliyor (30 hisse ~1 dakika sürebilir)..."):
+                fund_df = fetch_bist30_fundamentals(tuple(bist_tickers))
+
+            if fund_df.empty:
+                st.warning("Hiçbir hisse için veri çekilemedi.")
+            else:
+                scored_df = compute_value_scores(fund_df)
+
+                # --- Endeks Geneli Özet ---
+                st.divider()
+                st.subheader("📊 Endeks Geneli Özet")
+
+                w_pe = weighted_avg(scored_df["F/K"], scored_df["Piyasa Değeri (Milyar $)"])
+                w_pb = weighted_avg(scored_df["PD/DD"], scored_df["Piyasa Değeri (Milyar $)"])
+                simple_dy = scored_df["Temettü Verimi %"].mean(skipna=True)
+                simple_roe = scored_df["ROE %"].mean(skipna=True)
+
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Piyasa Değeri Ağırlıklı F/K", f"{w_pe:.1f}" if w_pe else "—")
+                s2.metric("Piyasa Değeri Ağırlıklı PD/DD", f"{w_pb:.1f}" if w_pb else "—")
+                s3.metric("Ort. Temettü Verimi", f"{simple_dy:.1f}%" if pd.notna(simple_dy) else "—")
+                s4.metric("Ort. ROE", f"{simple_roe:.1f}%" if pd.notna(simple_roe) else "—")
+                st.caption(
+                    "F/K ve PD/DD, her hissenin piyasa değeriyle ağırlıklandırılmıştır — "
+                    "yani büyük şirketler (bankalar, TUPRS, THYAO gibi) endeks ortalamasını "
+                    "daha çok etkiler, tıpkı gerçek BIST 30 endeksinin hesaplanma mantığı gibi."
+                )
+
+                # --- Sektör Kırılımı ---
+                st.divider()
+                st.subheader("🏭 Sektör Kırılımı")
+                sector_summary = scored_df.groupby("Sektör").agg(
+                    Hisse_Sayısı=("Sembol", "count"),
+                    Ort_FK=("F/K", "mean"),
+                    Ort_PDDD=("PD/DD", "mean"),
+                    Ort_Temettü=("Temettü Verimi %", "mean"),
+                    Toplam_Piyasa_Değeri=("Piyasa Değeri (Milyar $)", "sum"),
+                ).reset_index().sort_values("Toplam_Piyasa_Değeri", ascending=False)
+                sector_summary.columns = ["Sektör", "Hisse Sayısı", "Ort. F/K", "Ort. PD/DD",
+                                           "Ort. Temettü %", "Toplam Piyasa Değeri (Milyar $)"]
+                st.dataframe(
+                    sector_summary.round(2), use_container_width=True, hide_index=True
+                )
+                st.caption(
+                    "Bankacılık sektörü genelde BIST 30'da en yüksek ağırlığa sahiptir — "
+                    "bu yüzden banka hisselerindeki hareketler endeksin günlük yönünü "
+                    "orantısız şekilde etkileyebilir."
+                )
+
+                # --- Değerleme Skoru Sıralaması ---
+                st.divider()
+                st.subheader("🏆 Değerleme Skoru Sıralaması")
+                st.caption(
+                    "Her hisse, listedeki DİĞER 29 hisseye göre göreli olarak puanlanır "
+                    "(0-100): düşük F/K ve PD/DD (ucuzluk) + yüksek temettü verimi ve ROE "
+                    "(kârlılık) yüksek skor alır. Bu MUTLAK bir 'ucuz/pahalı' hükmü değildir "
+                    "— sadece listedeki hisseleri birbirine göre sıralar. Eşit ağırlıklı, "
+                    "şeffaf bir formül kullanılır; yatırım tavsiyesi değildir."
+                )
+
+                display_df = scored_df[[
+                    "Sembol", "Sektör", "Değerleme Skoru", "F/K", "PD/DD",
+                    "Temettü Verimi %", "ROE %", "Net Kâr Marjı %", "Beta",
+                    "1A Getiri %", "3A Getiri %", "YBB Getiri %",
+                    "Piyasa Değeri (Milyar $)",
+                ]].sort_values("Değerleme Skoru", ascending=False)
+
+                st.dataframe(
+                    display_df.round(2), use_container_width=True, hide_index=True
+                )
+
+                valid_scores = scored_df.dropna(subset=["Değerleme Skoru"])
+                if len(valid_scores) >= 5:
+                    st.divider()
+                    col_cheap, col_expensive = st.columns(2)
+                    with col_cheap:
+                        st.markdown("**🟢 En Yüksek Skorlu 5 Hisse**")
+                        top5 = valid_scores.nlargest(5, "Değerleme Skoru")[["Sembol", "Değerleme Skoru", "F/K", "ROE %"]]
+                        st.dataframe(top5.round(1), use_container_width=True, hide_index=True)
+                    with col_expensive:
+                        st.markdown("**🔴 En Düşük Skorlu 5 Hisse**")
+                        bottom5 = valid_scores.nsmallest(5, "Değerleme Skoru")[["Sembol", "Değerleme Skoru", "F/K", "ROE %"]]
+                        st.dataframe(bottom5.round(1), use_container_width=True, hide_index=True)
+
+                st.divider()
+                st.info(
+                    "📌 **Bu panel nasıl okunmalı:** Yüksek Değerleme Skoru, hissenin "
+                    "listedeki emsallerine göre 'ucuz + kârlı' göründüğünü gösterir — ama "
+                    "bu şirketin neden ucuz olduğunu (zayıf büyüme beklentisi, sektörel risk, "
+                    "yönetişim sorunu vb.) açıklamaz. Düşük F/K bazen 'fırsat', bazen 'haklı "
+                    "sebeple ucuz' anlamına gelir. Momentum sütunları (1A/3A/YBB Getiri), "
+                    "piyasanın bu değerlemeye şu an nasıl tepki verdiğini gösterir — ikisini "
+                    "birlikte değerlendirmek tek başına hiçbirinden daha fazla fikir verir. "
+                    "Nihai yorum ve karar sana aittir.",
+                    icon="📌",
+                )
+
+                st.caption(
+                    "Veri kaynağı: Yahoo Finance. Bazı hisselerde bazı alanlar eksik/boş "
+                    "görünebilir — bu, Yahoo Finance'in BIST kapsama kısıtından kaynaklanır, "
+                    "veri hatası anlamına gelmez."
+                )
+    else:
+        st.info("👆 Listeyi kontrol et (gerekirse düzenle), sonra **Temel Analiz Verilerini Çek** butonuna bas.")
