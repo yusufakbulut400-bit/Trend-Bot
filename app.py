@@ -578,6 +578,18 @@ BIST30_SECTOR_FALLBACK = {
 }
 
 
+def normalize_yield_pct(raw_value, already_pct_threshold=1.0):
+    """Yahoo Finance'in yüzdesel alanları (dividendYield, ROE, kâr marjı)
+    sürüme/hisseye göre bazen ondalık kesir (0.045 = %4.5) bazen doğrudan
+    yüzde (4.5) olarak dönebiliyor. Gerçek bir kesir asla 1.0'ı (%100) geçmez
+    — bu yüzden 1.0'ın üzerindeki değerlerin zaten yüzde formatında geldiğini
+    varsayıp olduğu gibi bırakıyoruz, altındakileri kesir kabul edip 100 ile
+    çarpıyoruz."""
+    if raw_value is None:
+        return None
+    return float(raw_value) if raw_value > already_pct_threshold else float(raw_value) * 100
+
+
 @st.cache_data(ttl=3600)
 def fetch_bist30_fundamentals(tickers):
     """Her hisse için değerleme (F/K, PD/DD, temettü), kârlılık (ROE, net
@@ -617,14 +629,11 @@ def fetch_bist30_fundamentals(tickers):
                 "Sektör": sector,
                 "F/K": info.get("trailingPE"),
                 "PD/DD": info.get("priceToBook"),
-                "Temettü Verimi %": (info.get("dividendYield") * 100
-                                      if info.get("dividendYield") else None),
+                "Temettü Verimi %": normalize_yield_pct(info.get("dividendYield")),
                 "Piyasa Değeri (Milyar $)": (info.get("marketCap") / 1e9
                                               if info.get("marketCap") else None),
-                "ROE %": (info.get("returnOnEquity") * 100
-                          if info.get("returnOnEquity") else None),
-                "Net Kâr Marjı %": (info.get("profitMargins") * 100
-                                     if info.get("profitMargins") else None),
+                "ROE %": normalize_yield_pct(info.get("returnOnEquity")),
+                "Net Kâr Marjı %": normalize_yield_pct(info.get("profitMargins")),
                 "Beta": info.get("beta"),
                 "1A Getiri %": pct_change_back(21),
                 "3A Getiri %": pct_change_back(63),
@@ -671,23 +680,30 @@ def weighted_avg(values, weights):
 
 
 def render_single_result(df, result, symbol):
+    trend_emoji = {
+        "YÜKSELİŞ TRENDİ": "🟢",
+        "DÜŞÜŞ TRENDİ": "🔴",
+        "YATAY / BELİRSİZ": "🟡",
+    }[result["trend"]]
     trend_color = {
         "YÜKSELİŞ TRENDİ": "green",
         "DÜŞÜŞ TRENDİ": "red",
         "YATAY / BELİRSİZ": "orange",
     }[result["trend"]]
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Son Fiyat", f"{result['last_price']:.4f}")
-    col2.markdown(f"### Trend: :{trend_color}[{result['trend']}]")
-    col3.metric("Güven Skoru", f"{result['confidence']:.0f} / 100")
+    with st.container(border=True):
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Son Fiyat", f"{result['last_price']:.4f}")
+        col2.markdown(f"### {trend_emoji} :{trend_color}[{result['trend']}]")
+        col3.metric("Güven Skoru", f"{result['confidence']:.0f} / 100")
 
-    st.divider()
+    st.write("")
 
-    c1, c2, c3 = st.columns(3)
-    c1.markdown(f"**Kanal Yönü**\n\n{result['channel_direction']}  \n(R²={result['channel_r2']:.2f})")
-    c2.markdown(f"**MA Sinyali**\n\n{result['ma_signal']}")
-    c3.markdown(f"**Momentum**\n\n{result['momentum_signal']}  \nRSI(14): {result['rsi_value']:.1f}")
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"**📊 Kanal Yönü**\n\n{result['channel_direction']}  \n(R²={result['channel_r2']:.2f})")
+        c2.markdown(f"**📈 MA Sinyali**\n\n{result['ma_signal']}")
+        c3.markdown(f"**⚡ Momentum**\n\n{result['momentum_signal']}  \nRSI(14): {result['rsi_value']:.1f}")
 
     st.divider()
     st.subheader("Fiyat Grafiği")
@@ -772,8 +788,10 @@ def render_single_result(df, result, symbol):
 st.set_page_config(page_title="Trend Following Analiz Botu", page_icon="📈", layout="wide")
 
 st.title("📈 Trend Following Analiz Botu")
-st.caption("Hareketli ortalama + momentum + kanal analiziyle trend yönü tespiti")
-st.markdown("**Geliştirici:** Yusuf İslam Akbulut")
+st.caption(
+    "Hareketli ortalama + momentum + kanal analizi · Backtest · BIST 30 temel analiz · "
+    "Pozisyon hesaplayıcı  —  **Geliştirici:** Yusuf İslam Akbulut"
+)
 
 st.warning(
     "⚠️ Bu araç yalnızca teknik analiz amaçlıdır, yatırım tavsiyesi değildir. "
@@ -816,21 +834,27 @@ with st.expander("🌍 Makro Bağlam (Altın, BIST 30, Dolar Endeksi, Faiz, USD/
         else:
             st.caption("Makro veriler şu an çekilemedi.")
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🔍 Tekli Analiz", "📊 Çoklu Varlık Tarama", "🧪 Backtest", "🇹🇷 BIST 30 Değerleme"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🔍 Tekli Analiz", "📊 Çoklu Varlık Tarama", "🧪 Backtest",
+     "🇹🇷 BIST 30 Değerleme", "🧮 Pozisyon Hesaplayıcı"]
 )
 
 # --------------------------------------------------------------
-# SEKME 1: TEKLİ ANALİZ (eski davranış)
+# SEKME 1: TEKLİ ANALİZ
 # --------------------------------------------------------------
 with tab1:
-    with st.sidebar:
-        st.header("Tekli Analiz Ayarları")
+    st.subheader("Tek Bir Varlığı Analiz Et")
+
+    ic1, ic2, ic3 = st.columns([2, 1, 1])
+    with ic1:
         symbol = st.text_input("Sembol", value="BTC-USD",
                                 help="Örn: BTC-USD, THYAO.IS, AAPL, EURUSD=X, GC=F")
+    with ic2:
         period = st.selectbox("Zaman Aralığı", ["3mo", "6mo", "1y", "2y", "5y"], index=2, key="single_period")
+    with ic3:
         interval = st.selectbox("Mum Periyodu", ["1d", "1h", "1wk"], index=0, key="single_interval")
-        run = st.button("🔍 Analiz Et", type="primary", use_container_width=True)
+
+    run = st.button("🔍 Analiz Et", type="primary", use_container_width=True)
 
     if run:
         if yf is None:
@@ -844,7 +868,7 @@ with tab1:
             except Exception as e:
                 st.error(f"Hata oluştu: {e}")
     else:
-        st.info("👈 Soldan bir sembol seçip **Analiz Et** butonuna bas.")
+        st.info("👆 Bir sembol seçip **Analiz Et** butonuna bas.")
 
 # --------------------------------------------------------------
 # SEKME 2: ÇOKLU VARLIK TARAMA
@@ -993,17 +1017,18 @@ with tab3:
                     stats = bt_result["stats"]
 
                     st.divider()
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Toplam Getiri", f"{stats['total_return']:.1f}%")
-                    m2.metric("İşlem Sayısı", f"{stats['num_trades']}")
-                    m3.metric("Kazanma Oranı", f"{stats['win_rate']:.1f}%")
-                    m4.metric("Maksimum Düşüş", f"{stats['max_drawdown']:.1f}%")
+                    with st.container(border=True):
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Toplam Getiri", f"{stats['total_return']:.1f}%")
+                        m2.metric("İşlem Sayısı", f"{stats['num_trades']}")
+                        m3.metric("Kazanma Oranı", f"{stats['win_rate']:.1f}%")
+                        m4.metric("Maksimum Düşüş", f"{stats['max_drawdown']:.1f}%")
 
-                    m5, m6 = st.columns(2)
-                    m5.metric("Ort. Kazanç / Ort. Kayıp",
-                               f"{stats['avg_win']:.1f}% / {stats['avg_loss']:.1f}%")
-                    pf = stats["profit_factor"]
-                    m6.metric("Kâr Faktörü", "∞" if (pf != pf) else f"{pf:.2f}")
+                        m5, m6 = st.columns(2)
+                        m5.metric("Ort. Kazanç / Ort. Kayıp",
+                                   f"{stats['avg_win']:.1f}% / {stats['avg_loss']:.1f}%")
+                        pf = stats["profit_factor"]
+                        m6.metric("Kâr Faktörü", "∞" if (pf != pf) else f"{pf:.2f}")
 
                     st.divider()
                     st.subheader("Getiri Eğrisi")
@@ -1169,3 +1194,138 @@ with tab4:
                 )
     else:
         st.info("👆 Listeyi kontrol et (gerekirse düzenle), sonra **Temel Analiz Verilerini Çek** butonuna bas.")
+
+
+# --------------------------------------------------------------
+# SEKME 5: POZİSYON BÜYÜKLÜĞÜ HESAPLAYICI
+# --------------------------------------------------------------
+with tab5:
+    st.subheader("🧮 Pozisyon Büyüklüğü Hesaplayıcı")
+    st.caption(
+        "Sermayeni ve risk toleransını girerek, bir işlemde ne kadarlık pozisyon "
+        "açmanın 'standart risk kuralına' uyacağını hesaplar. Bu bir tavsiye değil, "
+        "sadece aritmetik bir araçtır — girdiği rakamlar tamamen sana ait kararlardır."
+    )
+
+    with st.container(border=True):
+        st.markdown("**1. Sermaye ve Risk**")
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            capital = st.number_input(
+                "Toplam İşlem Sermayesi", min_value=0.0, value=100000.0, step=1000.0,
+                help="Para birimi fark etmez — TL, USD, ne kullanıyorsan o birimde gir.",
+            )
+        with pc2:
+            risk_pct = st.slider(
+                "Bu İşlemde Riske Atılacak Sermaye (%)", 0.1, 10.0, 1.0, step=0.1,
+                help="Yaygın bir kural: tek işlemde sermayenin %1-2'sinden fazlasını "
+                     "riske atmamak. Bu senin tercihin, bot bir oran dayatmıyor.",
+            )
+
+    st.write("")
+
+    with st.container(border=True):
+        st.markdown("**2. İşlem Detayları**")
+        direction = st.radio("Yön", ["LONG (Alış)", "SHORT (Satış)"], horizontal=True)
+        is_long = direction.startswith("LONG")
+
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            entry_price = st.number_input("Giriş Fiyatı", min_value=0.0, value=100.0, step=0.1)
+
+        stop_method = st.radio(
+            "Stop-Loss Nasıl Belirlensin?",
+            ["Manuel fiyat gir", "ATR bazlı otomatik hesapla"],
+            horizontal=True,
+        )
+
+        stop_price = None
+        atr_info_text = ""
+
+        if stop_method == "Manuel fiyat gir":
+            with dc2:
+                stop_price = st.number_input("Stop-Loss Fiyatı", min_value=0.0, value=95.0, step=0.1)
+            with dc3:
+                take_profit = st.number_input("Kâr Al Fiyatı (opsiyonel)", min_value=0.0, value=0.0, step=0.1)
+        else:
+            atr_col1, atr_col2, atr_col3 = st.columns(3)
+            with atr_col1:
+                atr_symbol = st.text_input("ATR için Sembol", value="GC=F")
+            with atr_col2:
+                atr_multiplier = st.number_input("ATR Çarpanı", min_value=0.5, value=2.0, step=0.5,
+                                                   help="Yaygın kullanım: 1.5-3 arası. Yüksek çarpan = geniş stop.")
+            with atr_col3:
+                take_profit = st.number_input("Kâr Al Fiyatı (opsiyonel)", min_value=0.0, value=0.0, step=0.1)
+
+            if atr_symbol:
+                try:
+                    with st.spinner(f"{atr_symbol} için ATR hesaplanıyor..."):
+                        atr_raw_df = fetch_data(atr_symbol, period="6mo", interval="1d")
+                        current_atr = float(atr(atr_raw_df, window=14).dropna().iloc[-1])
+                    stop_distance_atr = current_atr * atr_multiplier
+                    stop_price = (entry_price - stop_distance_atr) if is_long else (entry_price + stop_distance_atr)
+                    atr_info_text = (
+                        f"Güncel ATR(14): **{current_atr:.4f}** × çarpan {atr_multiplier} = "
+                        f"stop mesafesi **{stop_distance_atr:.4f}** → hesaplanan stop: **{stop_price:.4f}**"
+                    )
+                except Exception as e:
+                    st.error(f"ATR hesaplanamadı: {e}")
+
+        if atr_info_text:
+            st.info(atr_info_text)
+
+    st.write("")
+
+    calc_run = st.button("🧮 Hesapla", type="primary", use_container_width=True)
+
+    if calc_run:
+        if stop_price is None or stop_price == entry_price:
+            st.error("Geçerli bir stop-loss fiyatı gerekiyor (giriş fiyatından farklı olmalı).")
+        elif capital <= 0:
+            st.error("Sermaye 0'dan büyük olmalı.")
+        else:
+            stop_distance = abs(entry_price - stop_price)
+            risk_amount = capital * (risk_pct / 100)
+            position_size = risk_amount / stop_distance
+            position_value = position_size * entry_price
+            leverage_needed = position_value / capital if capital > 0 else None
+
+            st.divider()
+            st.subheader("Sonuç")
+
+            with st.container(border=True):
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Risk Tutarı", f"{risk_amount:,.2f}")
+                r2.metric("Önerilen Pozisyon Büyüklüğü", f"{position_size:,.4f} adet/lot")
+                r3.metric("Toplam Pozisyon Değeri", f"{position_value:,.2f}")
+
+                r4, r5 = st.columns(2)
+                r4.metric("Stop-Loss Mesafesi", f"{stop_distance:.4f}")
+
+                if take_profit and take_profit > 0:
+                    reward = abs(take_profit - entry_price)
+                    rr_ratio = reward / stop_distance if stop_distance > 0 else None
+                    r5.metric("Risk / Ödül Oranı", f"1 : {rr_ratio:.2f}" if rr_ratio else "—")
+                else:
+                    r5.metric("Risk / Ödül Oranı", "Kâr al fiyatı girilmedi")
+
+            if leverage_needed and leverage_needed > 1:
+                st.warning(
+                    f"⚠️ Bu pozisyon değeri ({position_value:,.2f}), toplam sermayeni "
+                    f"({capital:,.2f}) aşıyor — yaklaşık **{leverage_needed:.2f}x kaldıraç** "
+                    "gerektirir. Kaldıraçlı işlem riskini artırır, bunu bilerek ilerlediğinden emin ol.",
+                    icon="⚠️",
+                )
+            else:
+                st.success(
+                    f"✅ Bu pozisyon, mevcut sermayenin içinde kaldıraçsız açılabilir "
+                    f"(sermayenin ~%{(position_value/capital*100):.1f}'i kullanılıyor)."
+                )
+
+            st.caption(
+                "📌 Formül: Risk Tutarı = Sermaye × Risk% · Pozisyon Büyüklüğü = Risk Tutarı ÷ "
+                "Stop Mesafesi. Bu, yaygın kullanılan standart bir risk-bazlı pozisyon "
+                "büyüklüğü hesaplama yöntemidir — kesin bir kural değil, bir başlangıç noktasıdır."
+            )
+    else:
+        st.info("👆 Sermaye, risk yüzdesi ve işlem detaylarını gir, sonra **Hesapla** butonuna bas.")
