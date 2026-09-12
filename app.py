@@ -1,16 +1,12 @@
 """
-TREND FOLLOWING ANALİZ BOTU — WEB UYGULAMASI
-==============================================
-Streamlit ile hazırlanmış, tarayıcıdan çalışan versiyon.
-Kullanıcılar hiçbir kurulum yapmadan, sadece link üzerinden
-sembol girip trend analizini görebilir.
+ALTIN (GOLD) TREND FOLLOWING ANALİZ BOTU — WEB UYGULAMASI
+============================================================
+Sadece altın ve altın ailesi enstrümanlarına (Ons Altın, Altın Vadeli
+İşlem, Gümüş, Altın Madenciliği ETF'leri) odaklanan bir analiz botu.
 
 Yerelde çalıştırmak için:
     pip install streamlit pandas numpy yfinance
     streamlit run app.py
-
-Herkese açık link için Streamlit Community Cloud'a deploy edilir
-(README_DEPLOY.md dosyasına bak).
 """
 
 import warnings
@@ -31,9 +27,9 @@ except ImportError:
 # ============================================================
 # EKONOMİK TAKVİM (FED Faiz Kararları + ABD İstihdam Verisi)
 # ============================================================
-# Not: FOMC tarihleri Fed'in resmi takviminden alınmıştır (2026).
-# NFP (Tarım Dışı İstihdam) her ayın ilk Cuma günü açıklanır (kural sabit).
-# Bu bir haber akışı değil, bilinen takvim tarihlerinin gösterimidir.
+# Bu iki veri, altın fiyatını en çok etkileyen ABD makro olaylarıdır:
+# faiz kararları doların ve reel faizlerin yönünü, istihdam verisi de
+# FED'in faiz politikası beklentisini şekillendirir.
 
 FOMC_DATES_2026 = [
     date(2026, 1, 28),
@@ -54,26 +50,20 @@ def first_friday(year: int, month: int) -> date:
 
 
 def get_upcoming_events(n_months: int = 3):
-    """Bugünden itibaren her ay için en fazla 2 önemli olay döndürür:
-    o ay bir FOMC toplantısı varsa onu, ayrıca ayın NFP (istihdam) tarihini."""
+    """Bugünden itibaren her ay için en fazla 2 önemli olay döndürür."""
     today = date.today()
     events = []
     year, month = today.year, today.month
 
     for _ in range(n_months):
         month_events = []
-
         fomc_this_month = [d for d in FOMC_DATES_2026 if d.year == year and d.month == month]
         for d in fomc_this_month:
             month_events.append(("🏦 FED Faiz Kararı (FOMC)", d))
-
         nfp_date = first_friday(year, month)
         month_events.append(("👷 ABD Tarım Dışı İstihdam (NFP)", nfp_date))
-
-        # Sadece bugün ve sonrası, ay başına en fazla 2 olay
         month_events = [e for e in month_events if e[1] >= today][:2]
         events.extend(month_events)
-
         month += 1
         if month > 12:
             month = 1
@@ -83,7 +73,64 @@ def get_upcoming_events(n_months: int = 3):
 
 
 # ============================================================
-# İNDİKATÖR FONKSİYONLARI (trend_following_bot.py ile aynı mantık)
+# ALTIN HABERLERİ (Yahoo Finance haber akışı — ücretsiz)
+# ============================================================
+
+@st.cache_data(ttl=900)
+def fetch_gold_news(max_items=8):
+    """Altın vadeli işlem sembolüne bağlı güncel haber başlıklarını çeker.
+    yfinance'in haber şeması sürüme göre değişebildiği için iki farklı
+    formatı da (eski/yeni) esnek şekilde okumaya çalışır."""
+    if yf is None:
+        return []
+    try:
+        raw_news = yf.Ticker("GC=F").news or []
+    except Exception:
+        return []
+
+    items = []
+    for n in raw_news[:max_items]:
+        title = n.get("title")
+        publisher = n.get("publisher")
+        link = n.get("link")
+        ts = n.get("providerPublishTime")
+
+        if not title and "content" in n:
+            content = n.get("content", {})
+            title = content.get("title")
+            provider = content.get("provider") or {}
+            publisher = provider.get("displayName")
+            url_obj = content.get("canonicalUrl") or content.get("clickThroughUrl") or {}
+            link = url_obj.get("url")
+            pub_date_str = content.get("pubDate")
+            if pub_date_str:
+                try:
+                    dt = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+                    ts = dt.timestamp()
+                except Exception:
+                    ts = None
+
+        if not title:
+            continue
+
+        time_str = None
+        if ts:
+            try:
+                time_str = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                time_str = None
+
+        items.append({
+            "title": title,
+            "publisher": publisher or "Bilinmeyen kaynak",
+            "link": link,
+            "time": time_str,
+        })
+    return items
+
+
+# ============================================================
+# İNDİKATÖR FONKSİYONLARI
 # ============================================================
 
 def sma(series, window):
@@ -153,7 +200,6 @@ def atr(df, window=14):
 
 
 def support_resistance(df, lookbacks=(20, 50)):
-    """Kısa ve orta vadeli en yakın destek/direnç seviyelerini döndürür."""
     levels = {}
     for lb in lookbacks:
         if len(df) >= lb:
@@ -165,8 +211,6 @@ def support_resistance(df, lookbacks=(20, 50)):
 
 
 def fibonacci_levels(df, lookback=100):
-    """Son `lookback` bar içindeki en yüksek/en düşük noktalar arasında
-    standart Fibonacci düzeltme seviyelerini hesaplar."""
     window = df.tail(min(lookback, len(df)))
     swing_high = float(window["High"].max())
     swing_low = float(window["Low"].min())
@@ -177,7 +221,6 @@ def fibonacci_levels(df, lookback=100):
 
 
 def volatility_regime(df, window=14, lookback=100):
-    """Güncel ATR'yi kendi geçmiş dağılımına göre değerlendirir."""
     atr_series = atr(df, window)
     recent = atr_series.dropna().tail(lookback)
     if recent.empty:
@@ -194,7 +237,6 @@ def volatility_regime(df, window=14, lookback=100):
 
 
 def volume_trend(df, short=20, long=60):
-    """Kısa vadeli ortalama hacmi, uzun vadeli ortalama hacimle kıyaslar."""
     if "Volume" not in df.columns or df["Volume"].sum() == 0:
         return None
     vol = df["Volume"]
@@ -212,7 +254,6 @@ def volume_trend(df, short=20, long=60):
 
 @st.cache_data(ttl=300)
 def fetch_weekly_confirmation(symbol):
-    """Haftalık zaman diliminde de trend aynı yönde mi kontrol eder."""
     try:
         wdf = yf.download(symbol, period="3y", interval="1wk", progress=False)
         if wdf.empty:
@@ -228,19 +269,21 @@ def fetch_weekly_confirmation(symbol):
         return None
 
 
+# ============================================================
+# MAKRO BAĞLAM (sadece altını etkileyen faktörler)
+# ============================================================
+
 MACRO_TICKERS = {
     "Altın (Ons - GC=F)": "GC=F",
-    "BIST 30": "XU030.IS",
+    "Gümüş (Korele Emtia)": "SI=F",
     "Dolar Endeksi (DXY)": "DX=F",
     "ABD 10Y Tahvil Faizi": "^TNX",
-    "USD/TRY": "TRY=X",
-    "S&P 500": "^GSPC",
+    "VIX (Korku Endeksi)": "^VIX",
 }
 
 
 @st.cache_data(ttl=600)
 def fetch_macro_snapshot():
-    """Makro bağlam göstergelerinin son değerini ve son 1 aylık değişimini çeker."""
     rows = []
     for label, ticker in MACRO_TICKERS.items():
         try:
@@ -257,7 +300,6 @@ def fetch_macro_snapshot():
                 "Gösterge": label,
                 "Son Değer": round(last_price, 2),
                 "1 Aylık Değişim": f"{change_pct:+.2f}%",
-                "_change_raw": change_pct,
             })
         except Exception:
             continue
@@ -267,15 +309,8 @@ def fetch_macro_snapshot():
 # ============================================================
 # BACKTEST MOTORU
 # ============================================================
-# Botun tekli analizde kullandığı AYNI ağırlıklandırılmış puanlama
-# mantığını, her gün için (o günkü veriye kadar bakarak, ileriye
-# sızıntı olmadan) hesaplayıp geçmişte üretmiş olacağı sinyalleri
-# simüle eder.
 
 def vectorized_trend_signal(df):
-    """Her satır için (o ana kadarki veriyle) trend sinyalini ve güven
-    skorunu hesaplar. Tüm göstergeler geriye dönük (rolling/ewm) olduğu
-    için ileriye veri sızıntısı yoktur."""
     df = df.copy()
     close = df["Close"]
     df["SMA50"] = sma(close, 50)
@@ -315,11 +350,6 @@ def vectorized_trend_signal(df):
 
 
 def run_backtest(raw_df, min_confidence=0, allow_short=False, cash_rate_annual=0.0):
-    """Botun sinyaline dayalı basit bir long/short simülasyonu çalıştırır.
-    Sinyal t günü kapanışına kadarki veriyle hesaplanır, pozisyon t+1
-    gününün getirisini yakalar (ileriye sızıntı yok). Pozisyon kapalıyken
-    (nakitte) `cash_rate_annual` (yıllık %) kadar bir para piyasası fonu/
-    mevduat getirisi varsayılır — fırsat maliyetini hesaba katmak için."""
     df = vectorized_trend_signal(raw_df)
     df = df.dropna(subset=["SMA200"]).copy()
     if len(df) < 30:
@@ -343,10 +373,8 @@ def run_backtest(raw_df, min_confidence=0, allow_short=False, cash_rate_annual=0
         position_shifted * daily_return.to_numpy(),
     )
     strat_return = pd.Series(strat_return_arr, index=df.index)
-
     equity = (1 + strat_return).cumprod()
 
-    # --- İşlem listesi çıkarma ---
     trades = []
     current_pos = 0
     entry_price = None
@@ -379,7 +407,6 @@ def run_backtest(raw_df, min_confidence=0, allow_short=False, cash_rate_annual=0
         })
 
     trades_df = pd.DataFrame(trades)
-
     total_return = (equity.iloc[-1] - 1) * 100
 
     if len(trades_df) > 0:
@@ -509,174 +536,19 @@ def analyze_trend(df, symbol=""):
 
 
 # ============================================================
-# HAZIR VARLIK LİSTELERİ (Çoklu Tarama için)
+# ALTIN AİLESİ ENSTRÜMANLARI (Çoklu Tarama için)
 # ============================================================
 
-ASSET_LISTS = {
-    "Emtialar": {
-        "Altın": "GC=F",
-        "Gümüş": "SI=F",
-        "Petrol (WTI)": "CL=F",
-        "Doğalgaz": "NG=F",
-        "Bakır": "HG=F",
-    },
-    "Kripto": {
-        "Bitcoin": "BTC-USD",
-        "Ethereum": "ETH-USD",
-        "Solana": "SOL-USD",
-        "BNB": "BNB-USD",
-        "XRP": "XRP-USD",
-    },
-    "Forex": {
-        "EUR/USD": "EURUSD=X",
-        "USD/TRY": "TRY=X",
-        "GBP/USD": "GBPUSD=X",
-        "USD/JPY": "JPY=X",
-    },
-    "BIST": {
-        "BIST 30 Endeksi": "XU030.IS",
-        "Türk Hava Yolları": "THYAO.IS",
-        "Aselsan": "ASELS.IS",
-        "Garanti BBVA": "GARAN.IS",
-        "Koç Holding": "KCHOL.IS",
-    },
+GOLD_FAMILY = {
+    "Altın Vadeli İşlem (COMEX)": "GC=F",
+    "Ons Altın (Spot)": "XAUUSD=X",
+    "Gümüş Vadeli İşlem": "SI=F",
+    "Altın ETF (SPDR Gold Shares)": "GLD",
+    "Altın Madenciliği ETF (GDX)": "GDX",
+    "Küçük Altın Madencileri ETF (GDXJ)": "GDXJ",
+    "Newmont Corporation": "NEM",
+    "Barrick Gold": "GOLD",
 }
-
-
-# ============================================================
-# BIST 30 DEĞERLEME PANELİ (temel analiz ağırlıklı)
-# ============================================================
-# NOT: Liste 9 Eylül 2026'da doğrulanan, Borsa İstanbul'un
-# 1 Temmuz - 30 Eylül 2026 dönemi için geçerli resmi BIST 30
-# bileşenlerine dayanır. Endeks üç ayda bir yeniden gözden
-# geçirilir (bir sonraki güncelleme dönemi: Ekim 2026 başı) —
-# o tarihten sonra listeyi kontrol edip gerekirse düzenle.
-
-BIST30_DEFAULT_TICKERS = [
-    "AEFES.IS", "AKBNK.IS", "ASELS.IS", "ASTOR.IS", "BIMAS.IS",
-    "DSTKF.IS", "EKGYO.IS", "ENKAI.IS", "EREGL.IS", "FROTO.IS",
-    "GARAN.IS", "GUBRF.IS", "ISCTR.IS", "KCHOL.IS", "KRDMD.IS",
-    "MGROS.IS", "PETKM.IS", "PGSUS.IS", "SAHOL.IS", "SASA.IS",
-    "SISE.IS", "TAVHL.IS", "TCELL.IS", "THYAO.IS", "TOASO.IS",
-    "TRALT.IS", "TTKOM.IS", "TUPRS.IS", "VAKBN.IS", "YKBNK.IS",
-]
-
-# Yahoo Finance'in 'sector'/'industry' alanı bazı BIST hisselerinde
-# boş dönebiliyor — bu yüzden ek olarak elle bir sektör haritası
-# tutuyoruz, dinamik veri eksik kalırsa buna düşer.
-BIST30_SECTOR_FALLBACK = {
-    "AEFES": "Gıda & İçecek", "AKBNK": "Bankacılık", "ASELS": "Savunma Sanayii",
-    "ASTOR": "Enerji Ekipmanları", "BIMAS": "Perakende", "DSTKF": "Finans",
-    "EKGYO": "Gayrimenkul", "ENKAI": "İnşaat", "EREGL": "Demir-Çelik",
-    "FROTO": "Otomotiv", "GARAN": "Bankacılık", "GUBRF": "Kimya/Gübre",
-    "ISCTR": "Bankacılık", "KCHOL": "Holding", "KRDMD": "Demir-Çelik",
-    "MGROS": "Perakende", "PETKM": "Petrokimya", "PGSUS": "Havacılık",
-    "SAHOL": "Holding", "SASA": "Kimya", "SISE": "Cam/Sanayi",
-    "TAVHL": "Havacılık", "TCELL": "Telekom", "THYAO": "Havacılık",
-    "TOASO": "Otomotiv", "TRALT": "Madencilik", "TTKOM": "Telekom",
-    "TUPRS": "Rafineri/Enerji", "VAKBN": "Bankacılık", "YKBNK": "Bankacılık",
-}
-
-
-def normalize_yield_pct(raw_value, already_pct_threshold=1.0):
-    """Yahoo Finance'in yüzdesel alanları (dividendYield, ROE, kâr marjı)
-    sürüme/hisseye göre bazen ondalık kesir (0.045 = %4.5) bazen doğrudan
-    yüzde (4.5) olarak dönebiliyor. Gerçek bir kesir asla 1.0'ı (%100) geçmez
-    — bu yüzden 1.0'ın üzerindeki değerlerin zaten yüzde formatında geldiğini
-    varsayıp olduğu gibi bırakıyoruz, altındakileri kesir kabul edip 100 ile
-    çarpıyoruz."""
-    if raw_value is None:
-        return None
-    return float(raw_value) if raw_value > already_pct_threshold else float(raw_value) * 100
-
-
-@st.cache_data(ttl=3600)
-def fetch_bist30_fundamentals(tickers):
-    """Her hisse için değerleme (F/K, PD/DD, temettü), kârlılık (ROE, net
-    kâr marjı), risk (beta) ve fiyat momentumu (1A/3A/Yılbaşından bu yana
-    getiri) verilerini çeker. Bazı alanlar bazı hisselerde eksik olabilir
-    (Yahoo Finance'in BIST kapsama kısıtı)."""
-    rows = []
-    for t in tickers:
-        symbol_short = t.replace(".IS", "")
-        try:
-            ticker_obj = yf.Ticker(t)
-            info = ticker_obj.info
-
-            hist = ticker_obj.history(period="1y")
-            last_close = float(hist["Close"].iloc[-1]) if not hist.empty else None
-
-            def pct_change_back(n_bars):
-                if hist.empty or len(hist) <= n_bars or last_close is None:
-                    return None
-                past = float(hist["Close"].iloc[-1 - n_bars])
-                if past == 0:
-                    return None
-                return (last_close / past - 1) * 100
-
-            ytd_return = None
-            if not hist.empty and last_close is not None:
-                this_year = hist[hist.index.year == hist.index[-1].year]
-                if len(this_year) > 1:
-                    first_close = float(this_year["Close"].iloc[0])
-                    if first_close != 0:
-                        ytd_return = (last_close / first_close - 1) * 100
-
-            sector = info.get("sector") or BIST30_SECTOR_FALLBACK.get(symbol_short, "Diğer")
-
-            rows.append({
-                "Sembol": symbol_short,
-                "Sektör": sector,
-                "F/K": info.get("trailingPE"),
-                "PD/DD": info.get("priceToBook"),
-                "Temettü Verimi %": normalize_yield_pct(info.get("dividendYield")),
-                "Piyasa Değeri (Milyar $)": (info.get("marketCap") / 1e9
-                                              if info.get("marketCap") else None),
-                "ROE %": normalize_yield_pct(info.get("returnOnEquity")),
-                "Net Kâr Marjı %": normalize_yield_pct(info.get("profitMargins")),
-                "Beta": info.get("beta"),
-                "1A Getiri %": pct_change_back(21),
-                "3A Getiri %": pct_change_back(63),
-                "YBB Getiri %": ytd_return,
-            })
-        except Exception:
-            continue
-    return pd.DataFrame(rows)
-
-
-def compute_value_scores(df):
-    """Şeffaf, çok faktörlü bir 'Değerleme Skoru' (0-100) hesaplar.
-    Düşük F/K ve PD/DD daha iyi (ucuzluk), yüksek temettü verimi ve ROE
-    daha iyi (kârlılık/getiri) olarak puanlanır — her metrik, listedeki
-    diğer hisselere göre yüzdelik dilimine (percentile) çevrilir, sonra
-    eşit ağırlıkla ortalanır. Bu bir 'doğru fiyat' iddiası değil, sadece
-    listedeki hisseleri birbirine göre sıralayan göreli bir ölçüttür."""
-    df = df.copy()
-
-    def low_better(s):
-        return (1 - s.rank(pct=True)) * 100
-
-    def high_better(s):
-        return s.rank(pct=True) * 100
-
-    df["_pe"] = low_better(df["F/K"])
-    df["_pb"] = low_better(df["PD/DD"])
-    df["_dy"] = high_better(df["Temettü Verimi %"])
-    df["_roe"] = high_better(df["ROE %"])
-
-    score_cols = ["_pe", "_pb", "_dy", "_roe"]
-    df["Metrik Sayısı"] = df[score_cols].notna().sum(axis=1)
-    df["Değerleme Skoru"] = df[score_cols].mean(axis=1, skipna=True).round(0)
-    df.loc[df["Metrik Sayısı"] < 2, "Değerleme Skoru"] = np.nan
-    df = df.drop(columns=score_cols)
-    return df
-
-
-def weighted_avg(values, weights):
-    mask = values.notna() & weights.notna()
-    if mask.sum() == 0:
-        return None
-    return float(np.average(values[mask], weights=weights[mask]))
 
 
 def render_single_result(df, result, symbol):
@@ -716,9 +588,6 @@ def render_single_result(df, result, symbol):
     st.subheader("MACD Histogram")
     st.bar_chart(df[["MACD_hist"]])
 
-    # --------------------------------------------------------------
-    # DERİNLEMESİNE TEKNİK ANALİZ
-    # --------------------------------------------------------------
     st.divider()
     st.subheader("🔬 Derinlemesine Teknik Analiz")
 
@@ -785,12 +654,12 @@ def render_single_result(df, result, symbol):
 # ARAYÜZ (STREAMLIT)
 # ============================================================
 
-st.set_page_config(page_title="Trend Following Analiz Botu", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Altın Trend Following Botu", page_icon="🥇", layout="wide")
 
-st.title("📈 Trend Following Analiz Botu")
+st.title("🥇 Altın (Gold) Trend Following Analiz Botu")
 st.caption(
-    "Hareketli ortalama + momentum + kanal analizi · Backtest · BIST 30 temel analiz · "
-    "Pozisyon hesaplayıcı  —  **Geliştirici:** Yusuf İslam Akbulut"
+    "Sadece altın ve altın ailesi enstrümanlarına odaklı: teknik analiz · backtest · "
+    "pozisyon hesaplayıcı · güncel haberler  —  **Geliştirici:** Yusuf İslam Akbulut"
 )
 
 st.warning(
@@ -798,6 +667,21 @@ st.warning(
     "Yatırım kararlarının sorumluluğu tamamen kullanıcıya aittir.",
     icon="⚠️",
 )
+
+with st.expander("📰 Altına Dair Güncel Haberler", expanded=True):
+    if yf is None:
+        st.caption("yfinance kurulu değil.")
+    else:
+        news_items = fetch_gold_news(max_items=8)
+        if news_items:
+            for item in news_items:
+                time_part = f" · {item['time']}" if item["time"] else ""
+                if item["link"]:
+                    st.markdown(f"- [{item['title']}]({item['link']}) — *{item['publisher']}*{time_part}")
+                else:
+                    st.markdown(f"- {item['title']} — *{item['publisher']}*{time_part}")
+        else:
+            st.caption("Şu an haber çekilemedi. Birkaç dakika sonra tekrar dene.")
 
 with st.expander("📅 Yaklaşan Önemli Ekonomik Olaylar", expanded=False):
     upcoming = get_upcoming_events(n_months=3)
@@ -807,48 +691,49 @@ with st.expander("📅 Yaklaşan Önemli Ekonomik Olaylar", expanded=False):
             gun_text = "Bugün" if days_left == 0 else f"{days_left} gün sonra"
             st.markdown(f"- **{label}** — {d.strftime('%d %B %Y')} ({gun_text})")
         st.caption(
-            "Bu tarihlerde piyasa volatilitesi artabilir, sinyal güvenilirliği "
-            "geçici olarak düşebilir. Sabit takvim kuralına dayanır (canlı haber akışı değildir)."
+            "Bu tarihlerde altın fiyatında volatilite artabilir — faiz kararları doları "
+            "ve reel faizleri, istihdam verisi de FED beklentisini doğrudan etkiler."
         )
     else:
         st.caption("Önümüzdeki dönem için gösterilecek olay bulunamadı.")
 
-with st.expander("🌍 Makro Bağlam (Altın, BIST 30, Dolar Endeksi, Faiz, USD/TRY, S&P 500)", expanded=False):
+with st.expander("🌍 Makro Bağlam (Dolar Endeksi, Faiz, VIX, Gümüş)", expanded=False):
     if yf is None:
         st.caption("yfinance kurulu değil.")
     else:
         macro_rows = fetch_macro_snapshot()
         if macro_rows:
-            macro_df = pd.DataFrame(macro_rows).drop(columns=["_change_raw"])
+            macro_df = pd.DataFrame(macro_rows)
             st.dataframe(macro_df, use_container_width=True, hide_index=True)
             st.caption(
                 f"🕒 Veriler canlı piyasa verisidir (en fazla 10 dakika önbelleklidir). "
                 f"Son kontrol: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
             )
             st.caption(
-                "Bu veriler sadece bağlam sağlar, yorum içermez. Genel kural olarak: "
-                "Dolar Endeksi ve ABD tahvil faizleri yükseldiğinde altın genelde baskı "
-                "altında kalır; USD/TRY yükseldiğinde BIST endeksleri döviz bazlı yatırımcı "
-                "için farklı bir tablo çizebilir. Yorumlama sana aittir."
+                "Genel kural: Dolar Endeksi ve ABD tahvil faizleri yükseldiğinde altın "
+                "genelde baskı altında kalır; VIX (korku endeksi) yükseldiğinde altın "
+                "güvenli liman talebiyle destek bulabilir. Yorumlama sana aittir."
             )
         else:
             st.caption("Makro veriler şu an çekilemedi.")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["🔍 Tekli Analiz", "📊 Çoklu Varlık Tarama", "🧪 Backtest",
-     "🇹🇷 BIST 30 Değerleme", "🧮 Pozisyon Hesaplayıcı"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["🔍 Tekli Analiz", "📊 Altın Ailesi Tarama", "🧪 Backtest", "🧮 Pozisyon Hesaplayıcı"]
 )
 
 # --------------------------------------------------------------
 # SEKME 1: TEKLİ ANALİZ
 # --------------------------------------------------------------
 with tab1:
-    st.subheader("Tek Bir Varlığı Analiz Et")
+    st.subheader("Altın Enstrümanını Analiz Et")
 
     ic1, ic2, ic3 = st.columns([2, 1, 1])
     with ic1:
-        symbol = st.text_input("Sembol", value="BTC-USD",
-                                help="Örn: BTC-USD, THYAO.IS, AAPL, EURUSD=X, GC=F")
+        symbol = st.selectbox(
+            "Enstrüman", list(GOLD_FAMILY.values()),
+            format_func=lambda x: next(k for k, v in GOLD_FAMILY.items() if v == x),
+            index=0, key="single_symbol",
+        )
     with ic2:
         period = st.selectbox("Zaman Aralığı", ["3mo", "6mo", "1y", "2y", "5y"], index=2, key="single_period")
     with ic3:
@@ -868,34 +753,18 @@ with tab1:
             except Exception as e:
                 st.error(f"Hata oluştu: {e}")
     else:
-        st.info("👆 Bir sembol seçip **Analiz Et** butonuna bas.")
+        st.info("👆 Bir enstrüman seçip **Analiz Et** butonuna bas.")
 
 # --------------------------------------------------------------
-# SEKME 2: ÇOKLU VARLIK TARAMA
+# SEKME 2: ALTIN AİLESİ TARAMA
 # --------------------------------------------------------------
 with tab2:
-    st.subheader("Birden fazla varlığı aynı anda tara")
-
-    scan_source = st.radio(
-        "Taranacak liste",
-        ["Hazır liste seç", "Kendi listemi gireyim"],
-        horizontal=True,
+    st.subheader("Altın Ailesindeki Tüm Enstrümanları Tara")
+    st.caption(
+        "Altın, gümüş ve altınla ilişkili hisse/ETF'leri aynı anda tarayıp hangisinde "
+        "daha net bir trend olduğunu karşılaştırır."
     )
-
-    symbols_to_scan = {}
-
-    if scan_source == "Hazır liste seç":
-        list_name = st.selectbox("Kategori", list(ASSET_LISTS.keys()))
-        symbols_to_scan = ASSET_LISTS[list_name]
-        st.caption("Taranacaklar: " + ", ".join(f"{k} ({v})" for k, v in symbols_to_scan.items()))
-    else:
-        custom_input = st.text_area(
-            "Sembolleri virgülle ayırarak gir",
-            value="GC=F, SI=F, BTC-USD",
-            help="Örn: GC=F, SI=F, BTC-USD, THYAO.IS",
-        )
-        raw_symbols = [s.strip() for s in custom_input.split(",") if s.strip()]
-        symbols_to_scan = {s: s for s in raw_symbols}
+    st.caption("Taranacaklar: " + ", ".join(f"{k} ({v})" for k, v in GOLD_FAMILY.items()))
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -908,20 +777,18 @@ with tab2:
     if scan_run:
         if yf is None:
             st.error("yfinance kurulu değil.")
-        elif not symbols_to_scan:
-            st.warning("Taranacak sembol bulunamadı.")
         else:
             rows = []
             errors = []
             progress = st.progress(0, text="Taranıyor...")
-            total = len(symbols_to_scan)
+            total = len(GOLD_FAMILY)
 
-            for i, (label, sym) in enumerate(symbols_to_scan.items()):
+            for i, (label, sym) in enumerate(GOLD_FAMILY.items()):
                 try:
                     raw_df = fetch_data(sym, period=scan_period, interval=scan_interval)
                     _, result = analyze_trend(raw_df, symbol=sym)
                     rows.append({
-                        "Varlık": label,
+                        "Enstrüman": label,
                         "Sembol": sym,
                         "Trend": result["trend"],
                         "Güven Skoru": round(result["confidence"]),
@@ -952,12 +819,14 @@ with tab2:
                 )
                 st.caption("Tablo güven skoruna göre büyükten küçüğe sıralanmıştır.")
             else:
-                st.warning("Hiçbir sembol için sonuç alınamadı.")
+                st.warning("Hiçbir enstrüman için sonuç alınamadı.")
 
             if errors:
-                with st.expander(f"⚠️ {len(errors)} sembolde hata oluştu (detay için tıkla)"):
+                with st.expander(f"⚠️ {len(errors)} enstrümanda hata oluştu (detay için tıkla)"):
                     for err in errors:
                         st.write(f"- {err}")
+    else:
+        st.info("👆 Ayarları seçip **Taramayı Başlat** butonuna bas.")
 
 # --------------------------------------------------------------
 # SEKME 3: BACKTEST
@@ -972,8 +841,11 @@ with tab3:
 
     bcol1, bcol2, bcol3 = st.columns(3)
     with bcol1:
-        bt_symbol = st.text_input("Sembol", value="GC=F", key="bt_symbol",
-                                   help="Örn: GC=F (Altın), XU030.IS (BIST 30)")
+        bt_symbol = st.selectbox(
+            "Enstrüman", list(GOLD_FAMILY.values()),
+            format_func=lambda x: next(k for k, v in GOLD_FAMILY.items() if v == x),
+            index=0, key="bt_symbol",
+        )
     with bcol2:
         bt_period = st.selectbox("Test Dönemi", ["1y", "2y", "5y", "max"], index=1, key="bt_period")
     with bcol3:
@@ -993,8 +865,7 @@ with tab3:
             "Nakitte Bekleme Faizi (Yıllık %)",
             min_value=0.0, max_value=100.0, value=0.0, step=1.0,
             help="Pozisyon kapalıyken (nakitte) paranın bir para piyasası fonu/mevduatta "
-                 "kazanacağı varsayılan yıllık faiz. Fırsat maliyetini hesaba katar. "
-                 "0 = nakit hiç getiri kazanmıyor varsayımı.",
+                 "kazanacağı varsayılan yıllık faiz. 0 = nakit hiç getiri kazanmıyor varsayımı.",
         )
 
     bt_run = st.button("🧪 Backtest Çalıştır", type="primary")
@@ -1054,157 +925,17 @@ with tab3:
             except Exception as e:
                 st.error(f"Hata oluştu: {e}")
     else:
-        st.info("👆 Sembol ve ayarları seçip **Backtest Çalıştır** butonuna bas.")
+        st.info("👆 Ayarları seçip **Backtest Çalıştır** butonuna bas.")
 
 # --------------------------------------------------------------
-# SEKME 4: BIST 30 DEĞERLEME PANELİ
+# SEKME 4: POZİSYON BÜYÜKLÜĞÜ HESAPLAYICI
 # --------------------------------------------------------------
 with tab4:
-    st.subheader("🇹🇷 BIST 30 — Temel Analiz Paneli")
-    st.caption(
-        "Endeksi oluşturan 30 hissenin değerleme (F/K, PD/DD, temettü), kârlılık "
-        "(ROE, net kâr marjı), risk (beta) ve fiyat momentumu verilerini birleştirir. "
-        "TCMB kararları, enflasyon, jeopolitik risk gibi makro yorumlar için sayfa "
-        "üstündeki '🌍 Makro Bağlam' panelini kullan — burası şirket düzeyinde veriye odaklanır."
-    )
-
-    st.warning(
-        "⚠️ Liste, 9 Eylül 2026'da doğrulanan Borsa İstanbul'un 2026 Q3 (1 Temmuz - "
-        "30 Eylül) resmi BIST 30 bileşenlerine dayanır. Endeks üç ayda bir yeniden "
-        "gözden geçirilir — bir sonraki dönemden (Ekim 2026) itibaren borsaistanbul.com "
-        "üzerinden kontrol edip gerekirse aşağıdan düzenle.",
-        icon="⚠️",
-    )
-
-    with st.expander("Sembol listesini görüntüle / düzenle"):
-        bist_tickers_input = st.text_area(
-            "BIST 30 Sembolleri (virgülle ayrılmış, .IS uzantılı)",
-            value=", ".join(BIST30_DEFAULT_TICKERS),
-            height=100,
-        )
-    bist_tickers = [t.strip() for t in bist_tickers_input.split(",") if t.strip()]
-
-    bist_run = st.button("📋 Temel Analiz Verilerini Çek", type="primary")
-
-    if bist_run:
-        if yf is None:
-            st.error("yfinance kurulu değil.")
-        else:
-            with st.spinner(f"{len(bist_tickers)} hisse için veri çekiliyor (30 hisse ~1 dakika sürebilir)..."):
-                fund_df = fetch_bist30_fundamentals(tuple(bist_tickers))
-
-            if fund_df.empty:
-                st.warning("Hiçbir hisse için veri çekilemedi.")
-            else:
-                scored_df = compute_value_scores(fund_df)
-
-                # --- Endeks Geneli Özet ---
-                st.divider()
-                st.subheader("📊 Endeks Geneli Özet")
-
-                w_pe = weighted_avg(scored_df["F/K"], scored_df["Piyasa Değeri (Milyar $)"])
-                w_pb = weighted_avg(scored_df["PD/DD"], scored_df["Piyasa Değeri (Milyar $)"])
-                simple_dy = scored_df["Temettü Verimi %"].mean(skipna=True)
-                simple_roe = scored_df["ROE %"].mean(skipna=True)
-
-                s1, s2, s3, s4 = st.columns(4)
-                s1.metric("Piyasa Değeri Ağırlıklı F/K", f"{w_pe:.1f}" if w_pe else "—")
-                s2.metric("Piyasa Değeri Ağırlıklı PD/DD", f"{w_pb:.1f}" if w_pb else "—")
-                s3.metric("Ort. Temettü Verimi", f"{simple_dy:.1f}%" if pd.notna(simple_dy) else "—")
-                s4.metric("Ort. ROE", f"{simple_roe:.1f}%" if pd.notna(simple_roe) else "—")
-                st.caption(
-                    "F/K ve PD/DD, her hissenin piyasa değeriyle ağırlıklandırılmıştır — "
-                    "yani büyük şirketler (bankalar, TUPRS, THYAO gibi) endeks ortalamasını "
-                    "daha çok etkiler, tıpkı gerçek BIST 30 endeksinin hesaplanma mantığı gibi."
-                )
-
-                # --- Sektör Kırılımı ---
-                st.divider()
-                st.subheader("🏭 Sektör Kırılımı")
-                sector_summary = scored_df.groupby("Sektör").agg(
-                    Hisse_Sayısı=("Sembol", "count"),
-                    Ort_FK=("F/K", "mean"),
-                    Ort_PDDD=("PD/DD", "mean"),
-                    Ort_Temettü=("Temettü Verimi %", "mean"),
-                    Toplam_Piyasa_Değeri=("Piyasa Değeri (Milyar $)", "sum"),
-                ).reset_index().sort_values("Toplam_Piyasa_Değeri", ascending=False)
-                sector_summary.columns = ["Sektör", "Hisse Sayısı", "Ort. F/K", "Ort. PD/DD",
-                                           "Ort. Temettü %", "Toplam Piyasa Değeri (Milyar $)"]
-                st.dataframe(
-                    sector_summary.round(2), use_container_width=True, hide_index=True
-                )
-                st.caption(
-                    "Bankacılık sektörü genelde BIST 30'da en yüksek ağırlığa sahiptir — "
-                    "bu yüzden banka hisselerindeki hareketler endeksin günlük yönünü "
-                    "orantısız şekilde etkileyebilir."
-                )
-
-                # --- Değerleme Skoru Sıralaması ---
-                st.divider()
-                st.subheader("🏆 Değerleme Skoru Sıralaması")
-                st.caption(
-                    "Her hisse, listedeki DİĞER 29 hisseye göre göreli olarak puanlanır "
-                    "(0-100): düşük F/K ve PD/DD (ucuzluk) + yüksek temettü verimi ve ROE "
-                    "(kârlılık) yüksek skor alır. Bu MUTLAK bir 'ucuz/pahalı' hükmü değildir "
-                    "— sadece listedeki hisseleri birbirine göre sıralar. Eşit ağırlıklı, "
-                    "şeffaf bir formül kullanılır; yatırım tavsiyesi değildir."
-                )
-
-                display_df = scored_df[[
-                    "Sembol", "Sektör", "Değerleme Skoru", "F/K", "PD/DD",
-                    "Temettü Verimi %", "ROE %", "Net Kâr Marjı %", "Beta",
-                    "1A Getiri %", "3A Getiri %", "YBB Getiri %",
-                    "Piyasa Değeri (Milyar $)",
-                ]].sort_values("Değerleme Skoru", ascending=False)
-
-                st.dataframe(
-                    display_df.round(2), use_container_width=True, hide_index=True
-                )
-
-                valid_scores = scored_df.dropna(subset=["Değerleme Skoru"])
-                if len(valid_scores) >= 5:
-                    st.divider()
-                    col_cheap, col_expensive = st.columns(2)
-                    with col_cheap:
-                        st.markdown("**🟢 En Yüksek Skorlu 5 Hisse**")
-                        top5 = valid_scores.nlargest(5, "Değerleme Skoru")[["Sembol", "Değerleme Skoru", "F/K", "ROE %"]]
-                        st.dataframe(top5.round(1), use_container_width=True, hide_index=True)
-                    with col_expensive:
-                        st.markdown("**🔴 En Düşük Skorlu 5 Hisse**")
-                        bottom5 = valid_scores.nsmallest(5, "Değerleme Skoru")[["Sembol", "Değerleme Skoru", "F/K", "ROE %"]]
-                        st.dataframe(bottom5.round(1), use_container_width=True, hide_index=True)
-
-                st.divider()
-                st.info(
-                    "📌 **Bu panel nasıl okunmalı:** Yüksek Değerleme Skoru, hissenin "
-                    "listedeki emsallerine göre 'ucuz + kârlı' göründüğünü gösterir — ama "
-                    "bu şirketin neden ucuz olduğunu (zayıf büyüme beklentisi, sektörel risk, "
-                    "yönetişim sorunu vb.) açıklamaz. Düşük F/K bazen 'fırsat', bazen 'haklı "
-                    "sebeple ucuz' anlamına gelir. Momentum sütunları (1A/3A/YBB Getiri), "
-                    "piyasanın bu değerlemeye şu an nasıl tepki verdiğini gösterir — ikisini "
-                    "birlikte değerlendirmek tek başına hiçbirinden daha fazla fikir verir. "
-                    "Nihai yorum ve karar sana aittir.",
-                    icon="📌",
-                )
-
-                st.caption(
-                    "Veri kaynağı: Yahoo Finance. Bazı hisselerde bazı alanlar eksik/boş "
-                    "görünebilir — bu, Yahoo Finance'in BIST kapsama kısıtından kaynaklanır, "
-                    "veri hatası anlamına gelmez."
-                )
-    else:
-        st.info("👆 Listeyi kontrol et (gerekirse düzenle), sonra **Temel Analiz Verilerini Çek** butonuna bas.")
-
-
-# --------------------------------------------------------------
-# SEKME 5: POZİSYON BÜYÜKLÜĞÜ HESAPLAYICI
-# --------------------------------------------------------------
-with tab5:
     st.subheader("🧮 Pozisyon Büyüklüğü Hesaplayıcı")
     st.caption(
         "Sermayeni ve risk toleransını girerek, bir işlemde ne kadarlık pozisyon "
         "açmanın 'standart risk kuralına' uyacağını hesaplar. Bu bir tavsiye değil, "
-        "sadece aritmetik bir araçtır — girdiği rakamlar tamamen sana ait kararlardır."
+        "sadece aritmetik bir araçtır."
     )
 
     with st.container(border=True):
@@ -1231,7 +962,7 @@ with tab5:
 
         dc1, dc2, dc3 = st.columns(3)
         with dc1:
-            entry_price = st.number_input("Giriş Fiyatı", min_value=0.0, value=100.0, step=0.1)
+            entry_price = st.number_input("Giriş Fiyatı", min_value=0.0, value=2650.0, step=0.1)
 
         stop_method = st.radio(
             "Stop-Loss Nasıl Belirlensin?",
@@ -1244,13 +975,17 @@ with tab5:
 
         if stop_method == "Manuel fiyat gir":
             with dc2:
-                stop_price = st.number_input("Stop-Loss Fiyatı", min_value=0.0, value=95.0, step=0.1)
+                stop_price = st.number_input("Stop-Loss Fiyatı", min_value=0.0, value=2600.0, step=0.1)
             with dc3:
                 take_profit = st.number_input("Kâr Al Fiyatı (opsiyonel)", min_value=0.0, value=0.0, step=0.1)
         else:
             atr_col1, atr_col2, atr_col3 = st.columns(3)
             with atr_col1:
-                atr_symbol = st.text_input("ATR için Sembol", value="GC=F")
+                atr_symbol = st.selectbox(
+                    "ATR için Enstrüman", list(GOLD_FAMILY.values()),
+                    format_func=lambda x: next(k for k, v in GOLD_FAMILY.items() if v == x),
+                    key="atr_symbol",
+                )
             with atr_col2:
                 atr_multiplier = st.number_input("ATR Çarpanı", min_value=0.5, value=2.0, step=0.5,
                                                    help="Yaygın kullanım: 1.5-3 arası. Yüksek çarpan = geniş stop.")
